@@ -28,6 +28,11 @@ import { ghExecFileAsync } from '../git/runner'
 // 1-per-second "is it safe now?" polling pattern UIs tend to fall into.
 const RATE_LIMIT_CACHE_TTL_MS = 30_000
 let cached: GitHubRateLimitSnapshot | null = null
+// Why: failed probes are cached for the same TTL as successes. Refreshes fail
+// open past a failed probe, so on a host that can never report a budget (GHES
+// with rate limiting disabled 404s every probe) an uncached failure would cost
+// a gh subprocess per queued refresh.
+let probeFailure: { at: number; error: string } | null = null
 
 type GhRateLimitPayload = {
   resources?: {
@@ -59,6 +64,7 @@ function parseBucket(
 /** @internal — test-only */
 export function _resetRateLimitCache(): void {
   cached = null
+  probeFailure = null
 }
 
 // Why: hard-stop thresholds for the circuit breaker. We refuse to issue a new
@@ -107,6 +113,12 @@ export function rateLimitGuard(bucket: RateLimitBucketKind):
   // parseBucket fallback — don't block on missing data, that would brick the
   // app on a single bad rate_limit response).
   if (b.limit > 0 && b.remaining < floor) {
+    // Why: past resetAt means GitHub already reset the budget — the snapshot
+    // is merely unrefreshable (probes can keep failing). Staying blocked would
+    // hand the coordinator a past-due retry and spin its drain loop.
+    if (b.resetAt * 1000 <= Date.now()) {
+      return { blocked: false }
+    }
     return { blocked: true, remaining: b.remaining, limit: b.limit, resetAt: b.resetAt }
   }
   return { blocked: false }
@@ -134,6 +146,9 @@ export async function getRateLimit(options?: { force?: boolean }): Promise<GetRa
   if (!options?.force && cached && Date.now() - cached.fetchedAt < RATE_LIMIT_CACHE_TTL_MS) {
     return { ok: true, snapshot: cached }
   }
+  if (!options?.force && probeFailure && Date.now() - probeFailure.at < RATE_LIMIT_CACHE_TTL_MS) {
+    return { ok: false, error: probeFailure.error }
+  }
   await acquire()
   try {
     const { stdout } = await ghExecFileAsync(['api', 'rate_limit'], { encoding: 'utf-8' })
@@ -145,9 +160,11 @@ export async function getRateLimit(options?: { force?: boolean }): Promise<GetRa
       fetchedAt: Date.now()
     }
     cached = snapshot
+    probeFailure = null
     return { ok: true, snapshot }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
+    probeFailure = { at: Date.now(), error: message }
     return { ok: false, error: message }
   } finally {
     release()
